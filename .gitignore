@@ -1,0 +1,9 @@
+build/
+.vscode/
+*.o
+*.mod
+*.a
+*.dylib
+__pycache__/
+*.pyc
+.DS_Store
