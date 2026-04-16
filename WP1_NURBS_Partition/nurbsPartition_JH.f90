@@ -1,276 +1,295 @@
 !=======================================================================
-!  File:        nurbsPartition_JH.f90
-!  Description: Parallel partitioning of NURBS knot vectors
+!File:        nurbsPartition_JH.f90
+!Description: Parallel partitioning of NURBS knot vectors
 !=======================================================================
-!  Author:      Jude Hussain
-!  Institution: Queen's University Belfast
-!  Created:     2026
+!Author:      Jude Hussain
+!Institution: Queen's University Belfast
+!Created:     2026
 !=======================================================================
+!
+!Public routines
+!---------------
+!partitionNurbs        — general d-dimensional partitioning.
+!d=1 (curve), d=2 (surface), d=3 (volume) are special cases set by nDim.
+!
+!partitionNurbsCurve: wrapper for d=1 (nurbsCurve)
+!partitionNurbsSurface: wrapper for d=2 (nurbsSurface)
+!
+!Private methods
+!---------------
+!partitionOneDirection — all span arithmetic for one parametric
+!direction - dimension agnostic
+!
+!Control point storage convention (last index fastest, i.e., v-fastest for surfaces):
+!d=1:  index = i1
+!d=2:  index = i2 + (i1-1)*n2
+!=======================================================================
+
 module NURBS_PARTITION
 
 use NURBS_CURVES
 use NURBS_SURFACES
 
+implicit none
+
+private :: partitionOneDirection
+
 contains
 
-!========================================================================
-! Partition a NURBS curve knot vector across nP processors
-! Returns the local curve for processor iProc (1-indexed)
-!========================================================================
-
-subroutine partitionNurbsCurve(localCurve, globalCurve, nP, iProc)
+!=======================================================================
+!private subroutine: partitionOneDirection
+!
+!A dimension-agnostic generalization  of partitionNurbsCurve - contains
+!all span arithmetic for one direction 
+!
+!In:  U        — full knot vector
+!nOfKnots — length of U
+!q        — polynomial degree in this direction
+!nP       — number of processors in this direction
+!iProc    — this processor (1-indexed)
+!
+!Out: knotStart, knotEnd  — local knot index range in U
+!ctrlStarts, ctrlEnd  — local control point index range
+!=======================================================================
+subroutine partitionOneDirection(knotStart, knotEnd, ctrlStart, ctrlEnd, U, nOfKnots, q, nP, iProc)
 implicit none
-!intent are like python type hints but enforced, inent(in) means input, intent(out) means output, intent(inout) means both
-type(nurbsCurve), intent(out) :: localCurve
-type(nurbsCurve), intent(in)  :: globalCurve
-integer, intent(in) :: nP      ! number of processors
-integer, intent(in) :: iProc   ! this processor (1 to nP)
+
+double precision, intent(in) :: U(:)
+integer, intent(in)  :: nOfKnots, q, nP, iProc
+integer, intent(out) :: knotStart, knotEnd, ctrlStart, ctrlEnd
 
 double precision, allocatable :: uUnique(:)
-integer :: nSpans, spanStart, spanEnd
-integer :: knotStart, knotEnd
-integer :: ctrlStart, ctrlEnd
-integer :: nLocalKnots, nLocalCtrl
-integer :: i, q
+integer :: nSpans, spanStart, spanEnd, i
 
-q = globalCurve%q
+!Get breakpoints (unique knots) and corresponding nspans
+uUnique = uniqueReal(U(1:nOfKnots))
+nSpans  = size(uUnique) - 1
 
-! Get unique knot values (the breakpoints)
-uUnique = uniqueReal(globalCurve%U)
-nSpans = size(uUnique) - 1
+!Naive split of integer spans as per Swansea apporach
+spanStart = (iProc - 1)*nSpans/nP + 1
+spanEnd   =  iProc     *nSpans/nP
 
-! --- Step 1: naive split of knot spans across processors ---
-! divide spans as evenly as possible
-! this is all in integers - so n_proc isnt even, then load is inherently unbalanced
-!processor count starts from 0 in C but from 1 in fortran, so we use iProc-1 in the calculations
-spanStart = (iProc-1)*nSpans/nP + 1
-spanEnd   = iProc*nSpans/nP
+!Ghost layer: expand by q on each side
+!(Cox-de Boor needs q spans of context on each side to evaluate Ni,p)
+spanStart = max(1,      spanStart - q)
+spanEnd   = min(nSpans, spanEnd   + q)
 
-print *, "Proc", iProc, "owns knot spans", spanStart, "to", spanEnd
-
-! --- Step 2: expand by q spans on each side ---
-! this is the ghost layer at the NURBS level
-spanStart = max(1, spanStart - q)
-spanEnd   = min(nSpans, spanEnd + q)
-
-print *, "Proc", iProc, "expanded to spans", spanStart, "to", spanEnd
-
-! --- Step 3: find the corresponding knot indices ---
-! in the full knot vector (with repetitions)
-! knotStart is first knot of spanStart
-! knotEnd is last knot of spanEnd+1
+!Find knot indices for expanded span range
+!Forward search for knotStart, backward search for knotEnd
 knotStart = 1
-knotEnd   = globalCurve%nOfKnots
+knotEnd   = nOfKnots
 
-! find where spanStart begins in full knot vector
+!Finds first instance of the a knot value to maintain multiplity for Ni,p-1 evaluation
 i = 1
-do while(i <= globalCurve%nOfKnots)
-    if(abs(globalCurve%U(i) - uUnique(spanStart)) < 1.0D-12) then
+do while (i <= nOfKnots)
+    if (abs(U(i) - uUnique(spanStart)) < 1.0D-12) then
         knotStart = i
         exit
     end if
     i = i + 1
 end do
 
-! find where spanEnd ends in full knot vector
-i = globalCurve%nOfKnots
-do while(i >= 1)
-    if(abs(globalCurve%U(i) - uUnique(spanEnd+1)) < 1.0D-12) then
+!Finds last repeated instance of the a knot value to maintain multiplity for Ni+1,p-1 evaluation
+i = nOfKnots
+do while (i >= 1)
+    if (abs(U(i) - uUnique(spanEnd + 1)) < 1.0D-12) then
         knotEnd = i
         exit
     end if
     i = i - 1
 end do
 
-! --- Step 4: select control points ---
-! control point index = knot index - q
+!Obtain control point indices from knot indices
 ctrlStart = knotStart
 ctrlEnd   = knotEnd - q - 1
 
-nLocalKnots = knotEnd - knotStart + 1
-nLocalCtrl  = ctrlEnd - ctrlStart + 1
+end subroutine partitionOneDirection
 
-print *, "Proc", iProc, "knot indices", knotStart, "to", knotEnd
-print *, "Proc", iProc, "ctrl indices", ctrlStart, "to", ctrlEnd
 
-! --- Step 5: build local curve ---
-localCurve%q = q
-localCurve%nOfKnots = nLocalKnots
+!=======================================================================
+!public subroutine: partitionNurbs
+!
+!General d-dimensional NURBS partitioning for any parametric dimension
+!
+!Curves (d=1), surfaces (d=2) set by nDims. The code is extendable to
+!volumes (d=3), which requires a nurbsVolume definition in occ_inteface.cpp.
+
+!
+!The wrappers below (partitionNurbsCurve, partitionNurbsSurface)
+!unpack Swansea structs, call this routine, and repack
+!Extendable to other dimensions by defining an additional wrapper 
+!
+!inputs:
+!nDims                        —     number of parametric directions
+!knots(maxKnots, nDims)       — knot vectors as columns; pad shorter ones
+!with zeros (only nKnots(d) entries are read)
+!nKnots(nDims)                —     actual length of each knot vector
+!degrees(nDims)               —     polynomial degree per direction
+!nProcs(nDims)                —     number of processors per direction
+!iProcs(nDims)                —     this processor per direction (1-indexed)
+!
+!Out:
+!knotStarts(nDims)           — first knot index of local patch per direction
+!knotEnds(nDims)             — last  knot index of local patch per direction
+!ctrlStarts(nDims)           — first ctrl pt index per direction
+!ctrlEnds(nDims)             — last  ctrl pt index per direction
+!=======================================================================
+subroutine partitionNurbs(nDims, knots, nKnots, degrees, nProcs, iProcs, knotStarts, knotEnds, ctrlStarts, ctrlEnds)
+implicit none
+
+integer,          intent(in)  :: nDims
+double precision, intent(in)  :: knots(:,:)
+integer,          intent(in)  :: nKnots(nDims)
+integer,          intent(in)  :: degrees(nDims)
+integer,          intent(in)  :: nProcs(nDims)
+integer,          intent(in)  :: iProcs(nDims)
+integer,          intent(out) :: knotStarts(nDims), knotEnds(nDims)
+integer,          intent(out) :: ctrlStarts(nDims), ctrlEnds(nDims)
+
+integer :: d
+
+!Partition each direction independently, i.e. as in nurbsCurve
+!New wrapper must be written for higher nDims
+do d = 1, nDims
+    call partitionOneDirection( &
+        knotStarts(d), knotEnds(d), ctrlStarts(d), ctrlEnds(d), &
+        knots(:, d), nKnots(d), degrees(d), nProcs(d), iProcs(d))
+
+    print *, "Dim", d, "| knots", knotStarts(d), "to", knotEnds(d), &
+             "| ctrl",  ctrlStarts(d), "to", ctrlEnds(d)
+end do
+
+end subroutine partitionNurbs
+
+
+!=======================================================================
+!PUBLIC: partitionNurbsCurve  (d = 1)
+!
+!Wrapper using nurbsCurve - unpacks the struct, calls partitionNurbs, repacks result
+!=======================================================================
+subroutine partitionNurbsCurve(localCurve, globalCurve, nP, iProc)
+implicit none
+
+type(nurbsCurve), intent(out) :: localCurve
+type(nurbsCurve), intent(in)  :: globalCurve
+integer,          intent(in)  :: nP, iProc
+
+integer          :: knotStarts(1), knotEnds(1), ctrlStarts(1), ctrlEnds(1)
+integer          :: nLocalKnots, nLocalCtrl
+double precision :: knots(globalCurve%nOfKnots, 1)
+
+
+!Potential: add block to ensure that size(globalCurve%U) = globalCurve%nOfKnots to catch mismatches
+if (size(globalCurve%U) /= globalCurve%nOfKnots) then
+    error stop "partitionNurbsCurve: size(globalCurve%U) != globalCurve%nOfKnots"
+end if
+
+!Reshape for partitionNurbs: pack knot vector as a column.
+!partitionNurbs is dimension-agnostic so it expects a 2D array of knots, even for d=1
+knots(:, 1) = globalCurve%U
+
+call partitionNurbs( &
+    nDims      = 1,                        &
+    knots      = knots,                    &
+    nKnots     = [globalCurve%nOfKnots],   &  
+    degrees    = [globalCurve%q],          &
+    nProcs     = [nP],                     &
+    iProcs     = [iProc],                  &
+    knotStarts = knotStarts,               &
+    knotEnds   = knotEnds,                 &
+    ctrlStarts = ctrlStarts,               &
+    ctrlEnds   = ctrlEnds)
+
+nLocalKnots = knotEnds(1) - knotStarts(1) + 1
+nLocalCtrl  = ctrlEnds(1) - ctrlStarts(1) + 1
+
+localCurve%q                = globalCurve%q
+localCurve%nOfKnots         = nLocalKnots
 localCurve%nOfControlPoints = nLocalCtrl
 
+!allocate space for copies of the local knot vector and control points
 allocate(localCurve%U(nLocalKnots))
-!4 x nLocalCtrl array - actual coordinates are recovered via dividing by w component
 allocate(localCurve%Pw(4, nLocalCtrl))
 
-!this copies the local portion of the knot vector
-localCurve%U  = globalCurve%U(knotStart:knotEnd)
-!copies the corresponding control points including the weights
-localCurve%Pw = globalCurve%Pw(:, ctrlStart:ctrlEnd)
+!Copy global portion of knot vectors and control points into local curve
+localCurve%U  = globalCurve%U(knotStarts(1):knotEnds(1))
+localCurve%Pw = globalCurve%Pw(:, ctrlStarts(1):ctrlEnds(1))
 
 end subroutine partitionNurbsCurve
 
-!========================================================================
-! Partition a NURBS surface knot vectors across an nPu x nPv processor grid
-! Returns the local surface for processor (iPu, iPv), both 1-indexed
-!========================================================================
 
+!=======================================================================
+!partitionNurbsSurface  (public wrapper, d = 2)
+!
+!Wrapper using nurbSurface - unpacks the struct, calls partitionNurbs, repacks result
+!=======================================================================
 subroutine partitionNurbsSurface(localSurface, globalSurface, nPu, nPv, iPu, iPv)
 implicit none
 
 type(nurbsSurface), intent(out) :: localSurface
 type(nurbsSurface), intent(in)  :: globalSurface
-integer, intent(in) :: nPu      ! number of partitions in u direction
-integer, intent(in) :: nPv      ! number of partitions in v direction
-integer, intent(in) :: iPu      ! this partition in u (1 to nPu)
-integer, intent(in) :: iPv      ! this partition in v (1 to nPv)
+integer,            intent(in)  :: nPu, nPv, iPu, iPv
 
-double precision, allocatable :: uUnique(:), vUnique(:)
-integer :: nSpansU, nSpansV
-integer :: ownedStartU, ownedEndU, ownedStartV, ownedEndV
-integer :: spanStartU, spanEndU, spanStartV, spanEndV
-integer :: knotStartU, knotEndU, knotStartV, knotEndV
-integer :: ctrlStartU, ctrlEndU, ctrlStartV, ctrlEndV
-integer :: nLocalKnotsU, nLocalKnotsV
-integer :: nLocalCtrlU, nLocalCtrlV, nLocalCtrl
-integer :: i, qU, qV
-integer :: iuL, ivL, iuG, ivG, idxL, idxG
+integer          :: knotStarts(2), knotEnds(2), ctrlStarts(2), ctrlEnds(2)
+integer          :: nLocalKnotsU, nLocalKnotsV, nLocalCtrlU, nLocalCtrlV
+integer          :: maxKnots
+integer          :: iuL, ivL, iuG, ivG, idxL, idxG
+double precision, allocatable :: knots(:,:)
 
-qU = globalSurface%qU
-qV = globalSurface%qV
+!Pack both knot vectors as columns, pad shorter one with zeros
+!partitionOneDirection reads only nKnots(d) entries so padding is safe.
+maxKnots = max(globalSurface%nOfKnotsU, globalSurface%nOfKnotsV)
+allocate(knots(maxKnots, 2))
+knots = 0.0D0
+knots(1:globalSurface%nOfKnotsU, 1) = globalSurface%U
+knots(1:globalSurface%nOfKnotsV, 2) = globalSurface%V
 
-! Get unique knot values (the breakpoints) in each direction
-uUnique = uniqueReal(globalSurface%U)
-vUnique = uniqueReal(globalSurface%V)
+call partitionNurbs( &
+    nDims      = 2,                                                  &
+    knots      = knots,                                              &
+    nKnots     = [globalSurface%nOfKnotsU, globalSurface%nOfKnotsV], &
+    degrees    = [globalSurface%qU,        globalSurface%qV],        &
+    nProcs     = [nPu, nPv],                                         &
+    iProcs     = [iPu, iPv],                                         &
+    knotStarts = knotStarts,                                         &
+    knotEnds   = knotEnds,                                           &
+    ctrlStarts = ctrlStarts,                                         &
+    ctrlEnds   = ctrlEnds)
 
-nSpansU = size(uUnique) - 1
-nSpansV = size(vUnique) - 1
+nLocalKnotsU = knotEnds(1) - knotStarts(1) + 1
+nLocalKnotsV = knotEnds(2) - knotStarts(2) + 1
+nLocalCtrlU  = ctrlEnds(1) - ctrlStarts(1) + 1
+nLocalCtrlV  = ctrlEnds(2) - ctrlStarts(2) + 1
 
-! --- Step 1: naive split of knot spans across processor grid ---
-ownedStartU = (iPu-1)*nSpansU/nPu + 1
-ownedEndU   = iPu*nSpansU/nPu
-
-ownedStartV = (iPv-1)*nSpansV/nPv + 1
-ownedEndV   = iPv*nSpansV/nPv
-
-print *, "Proc (", iPu, ",", iPv, ") owns U spans", ownedStartU, "to", ownedEndU
-print *, "Proc (", iPu, ",", iPv, ") owns V spans", ownedStartV, "to", ownedEndV
-
-! --- Step 2: expand by qU and qV spans on each side ---
-! this is the ghost layer at the NURBS level
-spanStartU = max(1, ownedStartU - qU)
-spanEndU = min(nSpansU, ownedEndU + qU)
-
-spanStartV = max(1, ownedStartV - qV)
-spanEndV   = min(nSpansV, ownedEndV + qV)
-
-print *, "Proc (", iPu, ",", iPv, ") expanded U spans", spanStartU, "to", spanEndU
-print *, "Proc (", iPu, ",", iPv, ") expanded V spans", spanStartV, "to", spanEndV
-
-! --- Step 3: find corresponding knot indices in the full knot vectors ---
-! knotStartU is first knot of spanStartU
-! knotEndU   is last knot of spanEndU+1
-knotStartU = 1
-knotEndU   = globalSurface%nOfKnotsU
-
-i = 1
-do while(i <= globalSurface%nOfKnotsU)
-    if(abs(globalSurface%U(i) - uUnique(spanStartU)) < 1.0D-12) then
-        knotStartU = i
-        exit
-    end if
-    i = i + 1
-end do
-
-i = globalSurface%nOfKnotsU
-do while(i >= 1)
-    if(abs(globalSurface%U(i) - uUnique(spanEndU+1)) < 1.0D-12) then
-        knotEndU = i
-        exit
-    end if
-    i = i - 1
-end do
-
-! knotStartV is first knot of spanStartV
-! knotEndV   is last knot of spanEndV+1
-knotStartV = 1
-knotEndV   = globalSurface%nOfKnotsV
-
-i = 1
-do while(i <= globalSurface%nOfKnotsV)
-    if(abs(globalSurface%V(i) - vUnique(spanStartV)) < 1.0D-12) then
-        knotStartV = i
-        exit
-    end if
-    i = i + 1
-end do
-
-i = globalSurface%nOfKnotsV
-do while(i >= 1)
-    if(abs(globalSurface%V(i) - vUnique(spanEndV+1)) < 1.0D-12) then
-        knotEndV = i
-        exit
-    end if
-    i = i - 1
-end do
-
-! --- Step 4: select control points in both directions ---
-! same idea as for curves, but now we build a rectangular block
-ctrlStartU = knotStartU
-ctrlEndU   = knotEndU - qU - 1
-
-ctrlStartV = knotStartV
-ctrlEndV   = knotEndV - qV - 1
-
-nLocalKnotsU = knotEndU - knotStartU + 1
-nLocalKnotsV = knotEndV - knotStartV + 1
-
-nLocalCtrlU = ctrlEndU - ctrlStartU + 1
-nLocalCtrlV = ctrlEndV - ctrlStartV + 1
-nLocalCtrl  = nLocalCtrlU*nLocalCtrlV
-
-! print *, "Proc (", iPu, ",", iPv, ") U knot indices", knotStartU, "to", knotEndU
-! print *, "Proc (", iPu, ",", iPv, ") V knot indices", knotStartV, "to", knotEndV
-! print *, "Proc (", iPu, ",", iPv, ") U ctrl indices", ctrlStartU, "to", ctrlEndU
-! print *, "Proc (", iPu, ",", iPv, ") V ctrl indices", ctrlStartV, "to", ctrlEndV
-
-! --- Step 5: build local surface ---
-localSurface%qU = qU
-localSurface%qV = qV
-localSurface%nOfKnotsU = nLocalKnotsU
-localSurface%nOfKnotsV = nLocalKnotsV
+localSurface%qU                = globalSurface%qU
+localSurface%qV                = globalSurface%qV
+localSurface%nOfKnotsU         = nLocalKnotsU
+localSurface%nOfKnotsV         = nLocalKnotsV
 localSurface%nOfControlPointsU = nLocalCtrlU
 localSurface%nOfControlPointsV = nLocalCtrlV
-localSurface%nOfControlPoints  = nLocalCtrl
+localSurface%nOfControlPoints  = nLocalCtrlU * nLocalCtrlV
+localSurface%nOfPcurves        = 0
 
 allocate(localSurface%U(nLocalKnotsU))
 allocate(localSurface%V(nLocalKnotsV))
-allocate(localSurface%Pw(4, nLocalCtrl))
+allocate(localSurface%Pw(4, nLocalCtrlU * nLocalCtrlV))
 
-localSurface%U = globalSurface%U(knotStartU:knotEndU)
-localSurface%V = globalSurface%V(knotStartV:knotEndV)
+localSurface%U = globalSurface%U(knotStarts(1):knotEnds(1))
+localSurface%V = globalSurface%V(knotStarts(2):knotEnds(2))
 
-! trimming p-curves are not partitioned here
-localSurface%nOfPcurves = 0
-
-
-! --- Step 6: copy the rectangular block of control points ---
-! Pw is stored in flattened form with v varying fastest:
-! index = iv + (iu-1)*nOfControlPointsV
+!Copy the rectangular block of control points.
+!Pw is stored v-fastest: index = iv + (iu-1)*nOfControlPointsV
 do iuL = 1, nLocalCtrlU
-    iuG = ctrlStartU + iuL - 1
+    iuG = ctrlStarts(1) + iuL - 1
     do ivL = 1, nLocalCtrlV
-        ivG = ctrlStartV + ivL - 1
-
+        ivG  = ctrlStarts(2) + ivL - 1
         idxG = ivG + (iuG - 1)*globalSurface%nOfControlPointsV
         idxL = ivL + (iuL - 1)*nLocalCtrlV
-
         localSurface%Pw(:, idxL) = globalSurface%Pw(:, idxG)
     end do
 end do
 
-
 end subroutine partitionNurbsSurface
 
-!========================================================================
-
+!=======================================================================
 end module NURBS_PARTITION
