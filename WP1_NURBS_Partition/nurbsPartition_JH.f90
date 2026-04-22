@@ -10,7 +10,7 @@
 !Public routines
 !---------------
 !partitionNurbs        — general d-dimensional partitioning.
-!d=1 (curve), d=2 (surface), d=3 (volume) are special cases set by nDim.
+!d=1 (curve), d=2 (surface) are special cases of n.
 !
 !partitionNurbsCurve: wrapper for d=1 (nurbsCurve)
 !partitionNurbsSurface: wrapper for d=2 (nurbsSurface)
@@ -71,9 +71,8 @@ spanEnd   =  iProc     *nSpans/nP
 
 !Ghost layer: expand by q on each side
 !(Cox-de Boor needs q spans of context on each side to evaluate Ni,p)
-spanStart = max(1,      spanStart - q)
-spanEnd   = min(nSpans, spanEnd   + q)
-
+spanStart = max(1, spanStart - q - 1)
+spanEnd   = min(nSpans, spanEnd + q + 1)
 !Find knot indices for expanded span range
 !Forward search for knotStart, backward search for knotEnd
 knotStart = 1
@@ -153,7 +152,7 @@ integer :: d
 do d = 1, nDims
     call partitionOneDirection( &
         knotStarts(d), knotEnds(d), ctrlStarts(d), ctrlEnds(d), &
-        knots(:, d), nKnots(d), degrees(d), nProcs(d), iProcs(d))
+        knots(d,:), nKnots(d), degrees(d), nProcs(d), iProcs(d))
 
     print *, "Dim", d, "| knots", knotStarts(d), "to", knotEnds(d), &
              "| ctrl",  ctrlStarts(d), "to", ctrlEnds(d)
@@ -176,17 +175,16 @@ integer,          intent(in)  :: nP, iProc
 
 integer          :: knotStarts(1), knotEnds(1), ctrlStarts(1), ctrlEnds(1)
 integer          :: nLocalKnots, nLocalCtrl
-double precision :: knots(globalCurve%nOfKnots, 1)
-
+double precision :: knots(1,globalCurve%nOfKnots)
 
 !Potential: add block to ensure that size(globalCurve%U) = globalCurve%nOfKnots to catch mismatches
 if (size(globalCurve%U) /= globalCurve%nOfKnots) then
     error stop "partitionNurbsCurve: size(globalCurve%U) != globalCurve%nOfKnots"
 end if
 
-!Reshape for partitionNurbs: pack knot vector as a column.
-!partitionNurbs is dimension-agnostic so it expects a 2D array of knots, even for d=1
-knots(:, 1) = globalCurve%U
+!Reshape for partitionNurbs: pack knot vector as a row.
+!partitionNurbs expects knots(direction, knot_position) dimension-agnostic so it expects a 2D array of knots, even for d=1
+knots(1,:) = globalCurve%U
 
 call partitionNurbs( &
     nDims      = 1,                        &
@@ -229,20 +227,17 @@ implicit none
 type(nurbsSurface), intent(out) :: localSurface
 type(nurbsSurface), intent(in)  :: globalSurface
 integer,            intent(in)  :: nPu, nPv, iPu, iPv
-
 integer          :: knotStarts(2), knotEnds(2), ctrlStarts(2), ctrlEnds(2)
 integer          :: nLocalKnotsU, nLocalKnotsV, nLocalCtrlU, nLocalCtrlV
-integer          :: maxKnots
 integer          :: iuL, ivL, iuG, ivG, idxL, idxG
-double precision, allocatable :: knots(:,:)
-
+double precision :: knots(2, max(globalSurface%nOfKnotsU, globalSurface%nOfKnotsV))
 !Pack both knot vectors as columns, pad shorter one with zeros
 !partitionOneDirection reads only nKnots(d) entries so padding is safe.
-maxKnots = max(globalSurface%nOfKnotsU, globalSurface%nOfKnotsV)
-allocate(knots(maxKnots, 2))
+
 knots = 0.0D0
-knots(1:globalSurface%nOfKnotsU, 1) = globalSurface%U
-knots(1:globalSurface%nOfKnotsV, 2) = globalSurface%V
+
+knots(1, 1:globalSurface%nOfKnotsU) = globalSurface%U
+knots(2, 1:globalSurface%nOfKnotsV) = globalSurface%V
 
 call partitionNurbs( &
     nDims      = 2,                                                  &

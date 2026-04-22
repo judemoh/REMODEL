@@ -12,7 +12,11 @@ from OCC.Core.Bnd import Bnd_Box
 from OCC.Core.BRepBndLib import brepbndlib
 from OCC.Core.BRepAdaptor import BRepAdaptor_Curve
 from OCC.Core.GCPnts import GCPnts_AbscissaPoint
-# from to_vtk import 
+import pymetis
+import matplotlib.pyplot as plt
+import matplotlib.cm as cm
+import numpy as np
+
 
 def get_edge_length(edge):
     try:
@@ -29,100 +33,114 @@ def load_step(filename):
     reader.TransferRoots()
     return reader.OneShape()
 
+
 def brep_to_face_adjacency_graph(shape):
     G = nx.Graph()
-    
+
     # --- Build edge-to-face map first ---
     # this maps every edge -> list of faces that contain it
     edge_face_map = TopTools_IndexedDataMapOfShapeListOfShape()
-     # map eveery topological egde to its face, makes adjacency lookup direct direct during edge pass
-    #  topological edge to ancestor faces
+    # map every topological edge to its face, makes adjacency lookup direct during edge pass
+    # topological edge to ancestor faces
     topexp.MapShapesAndAncestors(shape, TopAbs_EDGE, TopAbs_FACE, edge_face_map)
-    
+
     # --- Node pass: one node per face ---
-    # computes per-face attributes (surface type, area, bounding boz midpoint as centroid prox and stores them alongside graph nodes)
+    # computes per-face attributes (surface type, area, bounding box midpoint as centroid proxy
+    # and stores them alongside graph nodes)
     face_explorer = TopExp_Explorer(shape, TopAbs_FACE)
     face_index = {}
     i = 0
-    # iterates through all faces 
+
+    # iterates through all faces
     while face_explorer.More():
-        # returns a generic Topods shape and downcasts it so face-sepcific APIs can be use d
+        # returns a generic TopoDS shape and downcasts it so face-specific APIs can be used
         face = topods.Face(face_explorer.Current())
-        # creates a geometry adaptor over undelrying surface
+        # creates a geometry adaptor over underlying surface
         adaptor = BRepAdaptor_Surface(face)
-        # identifying geometric type from a given shape - used for graph attributes or filtering later on  
-        surf_type = adaptor.GetType() 
-        # compute compound properties of a global geometric system
-       
-    #    container that holds geometric properties 
-        props = GProp_GProps() 
+        # identifying geometric type from a given shape - used for graph attributes or filtering later on
+        surf_type = adaptor.GetType()
+
+        # container that holds geometric properties
+        props = GProp_GProps()
         # traverses face and fills the container - integrates over 2D surface (surface integral)
         brepgprop.SurfaceProperties(face, props)
-        # retrieves the areas 
+        # retrieves the area
         area = props.Mass()
-        # bounding box approxomation falls apart when geoemtry isnt symmetric 
+
+        # bounding box approximation falls apart when geometry isn't symmetric
         bbox = Bnd_Box()
         brepbndlib.Add(face, bbox)
         xmin, ymin, zmin, xmax, ymax, zmax = bbox.Get()
         centroid = ((xmin+xmax)/2, (ymin+ymax)/2, (zmin+zmax)/2)
-        print(area)
-        print(centroid)
-# i may not be deterministic across different runs or machines, global ID must be intrinsic to CAD model itself i.e a hash or a deterministic ordering based on geometric properties (like centroid)
+
+        # i may not be deterministic across different runs or machines, global ID must be intrinsic
+        # to CAD model itself i.e a hash or a deterministic ordering based on geometric properties (like centroid)
         # graph with generic properties, can add as much info as required
-        G.add_node(i, shape=face, surface_type=surf_type, area=area, 
-           bbox=bbox, centroid=centroid, global_id=i, 
-           is_boundary=False, partition_id=None)  
-        
+        G.add_node(i, shape=face, surface_type=surf_type, area=area,
+                   bbox=bbox, centroid=centroid, global_id=i,
+                   is_boundary=False, partition_id=None)
+
         face_index[face.TShape()] = i
         i += 1
-
         face_explorer.Next()
-    # print(f"Extracted {G.number_of_nodes()} faces, {G.number_of_edges()} edges")
-    # print(f"Average degree: {sum(d for _,d in G.degree())/G.number_of_nodes():.2f}")
 
-  
     # --- Edge pass: connect faces sharing a topological edge ---
     # creates an explorer on the shape and the type of shapes to search
+    # edges are visited to establish which faces are adjacent
+    # edges are topological connectors, and aren't being stored in the graph
+    # the only thing extracted from each edge is its length, used as the edge weight
     edge_explorer = TopExp_Explorer(shape, TopAbs_EDGE)
     visited_edges = set()
-    
+
     while edge_explorer.More():
-        # current returns the current shape in exploration, casts it to the specific type that I need 
-        # grab the current object and make it useable as an egde 
+        # current returns the current shape in exploration, casts it to the specific type that I need
+        # grab the current object and make it useable as an edge
         edge = topods.Edge(edge_explorer.Current())
-        # thsape reutnrs the underlying topologicalentity which is a pointr to the shared geometry - two topods objects that look different but represent the same edge will have the same tshape
+        # TShape returns the underlying topological entity which is a pointer to the shared geometry
+        # two TopoDS objects that look different but represent the same edge will have the same TShape
+        # list of pointers to uniquely identify each edge
         edge_hash = edge.TShape()
-        print(f"Edge hash is {edge_hash}")
-        
+
         # check that you have not traversed this edge before
+        # avoid duplication of graph edges
         if edge_hash not in visited_edges:
             visited_edges.add(edge_hash)
             adjacent_faces = []
-            
+
+            # looks up the edge in the high-level map built by topexp.MapShapesAndAncestors
+            # takes each edge, retrieves all the faces that contain it, casts each from a generic
+            # shape to a face, and collects them in a list
+            # this is how the code knows which faces share which edge
             if edge_face_map.Contains(edge):
                 adjacent_face_list = edge_face_map.FindFromKey(edge)
                 for f in adjacent_face_list:
                     # cast it back to type 'face' so I can use it as a face
                     adjacent_faces.append(topods.Face(f))
-            
+
+            # Case 1: interior edge, two adjacent faces
+            # add graph edge between their nodes, weighted by the physical length of the shared curve
+            # this is what tells METIS later how expensive it would be to cut this connection
+            # longer shared boundaries = more inter-rank communication if cut
             if len(adjacent_faces) == 2:
-                # normal interior edge - connect the two faces
                 f0_hash = adjacent_faces[0].TShape()
                 f1_hash = adjacent_faces[1].TShape()
                 if f0_hash in face_index and f1_hash in face_index:
-                    # add a connection between niode f0 and f1 with this edge length as the weight 
+                    # add a connection between node f0 and f1 with this edge length as the weight
                     G.add_edge(face_index[f0_hash],
-                            face_index[f1_hash],
-                            weight=get_edge_length(edge))
-                            
+                               face_index[f1_hash],
+                               weight=get_edge_length(edge))
+
+            # Case 2: if only one adjacent face, it sits on the outer boundary of the model
+            # no graph edge is added because there is nothing to connect to
+            # face is flagged as a boundary face (during meshing: exposed edges with no geometric neighbour)
             elif len(adjacent_faces) == 1:
-                # boundary edge - mark face as boundary
                 f_hash = adjacent_faces[0].TShape()
                 if f_hash in face_index:
                     G.nodes[face_index[f_hash]]['is_boundary'] = True
-                    
+
+            # Case 3: non-manifold edge - more than two faces share this edge
+            # should not happen in a valid solid CAD model — connect all pairs defensively
             elif len(adjacent_faces) > 2:
-                # non-manifold edge - connect all pairs and flag
                 print(f"Warning: non-manifold edge with {len(adjacent_faces)} faces")
                 for idx1 in range(len(adjacent_faces)):
                     for idx2 in range(idx1+1, len(adjacent_faces)):
@@ -130,16 +148,16 @@ def brep_to_face_adjacency_graph(shape):
                         f1_hash = adjacent_faces[idx2].TShape()
                         if f0_hash in face_index and f1_hash in face_index:
                             G.add_edge(face_index[f0_hash],
-                                    face_index[f1_hash],
-                                    weight=get_edge_length(edge))
-        
+                                       face_index[f1_hash],
+                                       weight=get_edge_length(edge))
+
         edge_explorer.Next()
-        print(adjacent_face_list)
-        print(adjacent_faces)
+
     return G
 
-# convert network graph into CSR array for pymetis 
-def build_csr(G): 
+
+# convert NetworkX graph into CSR array for pymetis
+def build_csr(G):
     xadj = [0]
     adjacency_list = []
     weight_list = []
@@ -150,81 +168,89 @@ def build_csr(G):
         xadj.append(len(adjacency_list))
     return xadj, adjacency_list, weight_list
 
-# scales flaot edge weight into integrers and stores partition IDs on nodes 
-def partition_graph(G, n_partitions=None):
-    if n_partitions is None:
-        n_partitions = 4
+
+# scales float edge weights into integers and stores partition IDs on nodes
+def partition_graph(G, n_partitions=4):
+    """
+    Partition graph using METIS.
+    Edge weights: shared curve lengths (minimise communication cost).
+    Node weights: face areas (balance computational load).
+    Note: previously only edge weights were used. Adding vweights aligns
+    the partitioning objective with the load balance metric.
+    """
     print(f"Partitioning into {n_partitions} partitions")
-    
+
     xadj, adjacency_list, weight_list = build_csr(G)
-    # metis only accepts integers
+
+    # edge weights — shared curve lengths scaled to integers
+    # METIS minimises total cut edge weight (communication cost)
     int_eweights = [int(w * 1000) for w in weight_list]
+
+    # node weights — face areas scaled to integers
+    # METIS balances total node weight per partition (computational load)
+    # scaling: divide by min area so smallest face has weight 1
+    # this prevents integer overflow for large area differences
+    areas = [G.nodes[i]['area'] for i in range(len(G.nodes()))]
+    min_area = max(min(areas), 1e-6)   # guard against zero area
+    int_vweights = [max(1, int(a / min_area)) for a in areas]
+
     result = pymetis.part_graph(n_partitions,
                                 xadj=xadj,
                                 adjncy=adjacency_list,
-                                eweights=int_eweights)
+                                eweights=int_eweights,
+                                vweights=int_vweights)
+
     for node in G.nodes():
-        # index is node ID, value is the partition it was assigned to , this is stored as an attribute of the graph
+        # index is node ID, value is the partition it was assigned to,
+        # this is stored as an attribute of the graph
         G.nodes[node]['partition_id'] = int(result.vertex_part[node])
-    
-    # print(f"Partitioning complete")
+
     return G, result
 
 
 def visualize_graph(G):
-    # # use actual face centroids as 2D positions (drop z for now)
-    # pos = {node: (data['centroid'][0], data['centroid'][1]) 
-    #    for node, data in G.nodes(data=True)}
-    pos = {node: (data['centroid'][0], data['centroid'][2]) 
-       for node, data in G.nodes(data=True)}
+    # use actual face centroids as 2D positions (drop z for now)
+    pos = {node: (data['centroid'][0], data['centroid'][2])
+           for node, data in G.nodes(data=True)}
     coords = np.array(list(pos.values()))
     coords -= coords.min(axis=0)
     coords /= coords.max(axis=0)
     pos = {node: tuple(coords[i]) for i, node in enumerate(G.nodes())}
-
-    nx.draw(G, pos,
-            with_labels=True,
-            node_color='lightblue',
-            node_size=800,
-            edge_color='gray',
-            font_size=12,
-            font_weight='bold')
-    
+    nx.draw(G, pos, with_labels=True, node_color='lightblue',
+            node_size=800, edge_color='gray', font_size=12, font_weight='bold')
     plt.savefig("wing_connectivity.png")
 
-import matplotlib.cm as cm
-import numpy as np
+
 def visualize_partition(G, membership):
-    # changed this as most of the wing lives in z 
-    # pos = {node: (data['centroid'][0], data['centroid'][1]) 
-    #    for node, data in G.nodes(data=True)}
-    pos = {node: (data['centroid'][0], data['centroid'][2]) 
-       for node, data in G.nodes(data=True)}
+    # changed this as most of the wing lives in z
+    pos = {node: (data['centroid'][0], data['centroid'][2])
+           for node, data in G.nodes(data=True)}
     coords = np.array(list(pos.values()))
     coords -= coords.min(axis=0)
     coords /= coords.max(axis=0)
     pos = {node: tuple(coords[i]) for i, node in enumerate(G.nodes())}
-
     n_parts = len(set(membership))
     cmap = cm.get_cmap('tab20', n_parts)
     colors = [cmap(membership[node]) for node in G.nodes()]
-    
-    nx.draw(G, pos,
-            with_labels=False,
-            node_color=colors,
-            node_size=50,
-            edge_color='gray')
-    
+    nx.draw(G, pos, with_labels=False, node_color=colors,
+            node_size=50, edge_color='gray')
     plt.savefig('Complex_partitioned_adjacency.png')
+
 
 def assess_load_balance(G, n_partitions):
     total_area = sum(data['area'] for _, data in G.nodes(data=True))
     ideal_load = total_area / n_partitions
-    
-    partition_loads = {i: 0.0 for i in range(n_partitions)}
+
+    # initialise from actual partition IDs — METIS may not use all IDs
+    # if range(n_partitions) is used, a KeyError occurs when a partition
+    # number is skipped by METIS
+    all_partition_ids = set(data['partition_id']
+                            for _, data in G.nodes(data=True))
+    partition_loads = {pid: 0.0 for pid in all_partition_ids}
+
     for _, data in G.nodes(data=True):
         partition_loads[data['partition_id']] += data['area']
-    
+
     # count cut edges
     cut_edges = 0
     total_cut_weight = 0.0
@@ -232,26 +258,28 @@ def assess_load_balance(G, n_partitions):
         if G.nodes[u]['partition_id'] != G.nodes[v]['partition_id']:
             cut_edges += 1
             total_cut_weight += data['weight']
-    
-    # print(f"--- Partition Quality Report ---")
-    # print(f"Total area: {total_area:.4f}")
-    # print(f"Ideal load per partition: {ideal_load:.4f}")
-    # for pid, load in partition_loads.items():
-    #     imbalance = load / ideal_load
-    #     print(f"Partition {pid}: load = {load:.4f}, imbalance = {imbalance:.4f}")
-    # print(f"Cut edges: {cut_edges} / {G.number_of_edges()} total")
-    # print(f"Total cut weight: {total_cut_weight:.4f}")
-    # print(f"Cut ratio: {cut_edges/G.number_of_edges():.4f}")
-    # print(f"--------------------------------")
+
+    print(f"--- Partition Quality Report ---")
+    print(f"Total area:               {total_area:.4f}")
+    print(f"Ideal load per partition: {ideal_load:.4f}")
+    for pid, load in sorted(partition_loads.items()):
+        imbalance = load / ideal_load
+        print(f"  Partition {pid}: area={load:.4f}, imbalance={imbalance:.4f}")
+    print(f"Cut edges: {cut_edges} / {G.number_of_edges()} total")
+    print(f"Cut ratio: {cut_edges/G.number_of_edges():.4f}")
+    print(f"Total cut weight: {total_cut_weight:.4f}")
+    print(f"--------------------------------")
+
 
 def detect_dominant_faces(G, n_partitions, threshold=2.0):
     """
     Flags faces whose area exceeds threshold * ideal_load.
-    These faces will cause load imbalance and need subdivision.
+    These faces will cause load imbalance and need subdivision
+    via NURBS knot vector partitioning.
     """
     total_area = sum(data['area'] for _, data in G.nodes(data=True))
     ideal_load = total_area / n_partitions
-    
+
     dominant_faces = []
     for node, data in G.nodes(data=True):
         if data['area'] > threshold * ideal_load:
@@ -262,40 +290,26 @@ def detect_dominant_faces(G, n_partitions, threshold=2.0):
                 'partition_id': data['partition_id'],
                 'ratio': data['area'] / ideal_load
             })
-    
-    # print(f"\n--- Dominant Face Report ---")
-    # print(f"Ideal load per partition: {ideal_load:.2f}")
-    # print(f"Threshold: {threshold}x ideal = {threshold*ideal_load:.2f}")
-    # print(f"Dominant faces found: {len(dominant_faces)}")
-    # for f in dominant_faces:
-    #     print(f"  Node {f['node']}: area={f['area']:.2f}, "
-    #           f"ratio={f['ratio']:.2f}x ideal, "
-    #           f"partition={f['partition_id']}, "
-    #           f"centroid={f['centroid']}")
-    # print(f"----------------------------\n")
-    # return dominant_faces
 
-import pymetis
-import matplotlib.pyplot as plt
+    print(f"\n--- Dominant Face Report ---")
+    print(f"Ideal load per partition: {ideal_load:.2f}")
+    print(f"Threshold: {threshold}x ideal = {threshold*ideal_load:.2f}")
+    print(f"Dominant faces found: {len(dominant_faces)}")
+    for f in dominant_faces:
+        print(f"  Node {f['node']}: area={f['area']:.2f}, "
+              f"ratio={f['ratio']:.2f}x ideal, "
+              f"partition={f['partition_id']}, "
+              f"centroid={f['centroid']}")
+    print(f"----------------------------\n")
+    return dominant_faces
 
-# if __name__ == "__main__":
-shape = load_step("NACA_complex_file.step")
-G = brep_to_face_adjacency_graph(shape)
-G, result = partition_graph(G)
-# export_partitioned_vtk(G, "partitioned_wing.vtk") 
-# visualize_graph(G)
-# visualize_partition(G, result.vertex_part)
-# print(f"Nodes (faces): {G.number_of_nodes()}")
-# print(f"Edges (adjacencies): {G.number_of_edges()}")
-# print(f"Degree of each node (expected 4 for all):")
-# for node, deg in G.degree():
-#     print(f"  Face {node}: degree {deg}")
-# for node, data in G.nodes(data=True):
-#     print(f"Face {node}: area = {data['area']:.4f}")
-#     print(f"Face {node}: area = {data['centroid']}")
-# for u, v, data in G.edges(data=True):
-#     print(f"Edge ({u},{v}): length = {data['weight']:.4f}")
-n_parts = len(set(result.vertex_part))
-assess_load_balance(G, n_partitions=n_parts)
 
-# call it after building the graph
+if __name__ == "__main__":
+    N_PARTITIONS = 3
+
+    shape = load_step("/Users/jude/Documents/REMODEL/WP1_NURBS_Partition/data/NACA_complex_file.stp")
+    G = brep_to_face_adjacency_graph(shape)
+    G, result = partition_graph(G, n_partitions=N_PARTITIONS)
+
+    assess_load_balance(G, n_partitions=N_PARTITIONS)
+    detect_dominant_faces(G, n_partitions=N_PARTITIONS)

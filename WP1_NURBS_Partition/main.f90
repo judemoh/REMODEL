@@ -26,9 +26,14 @@ type(nurbsCurve) :: localCurve
 type(nurbsSurface) :: localSurface
 
 double precision :: u, v, uv(2), C(3), dC(3), S(3), dSu(3), dSv(3), x(3)
+double precision :: u_boundary, v_boundary
+double precision :: S_boundary(3), uv_recovered(2)
+double precision :: S_roundtrip(3)
 double precision :: globalPt(3), localPt(3), ptWeight
 integer :: iCurve, iSurface, iProc, nP
 integer :: iPu, iPv, nPu, nPv
+integer :: multStart, multEnd, ik
+
 
 
 !=======================================================================
@@ -55,10 +60,12 @@ do iProc = 1, nP
         print *, "Curve proc", iProc, ": PASS (tol 1e-12)"
     else
         print *, "Curve proc", iProc, ": FAIL — max error =", maxval(abs(globalPt - localPt))
+        
     end if
     deallocate(localCurve%U, localCurve%Pw)
 end do
- 
+print *, "End curve partitioning check"
+
 !=======================================================================
 ! Surface partitioning validation — 2x2 processor grid
 !=======================================================================
@@ -78,7 +85,57 @@ do iPu = 1, nPu
         end if
         deallocate(localSurface%U, localSurface%V, localSurface%Pw)
     end do
+
 end do
+print *, "End surface partitioning check"
+
+!=======================================================================
+! Testing inverse evaluation by projection - check if local and global coordinates match as before 
+!=======================================================================
+
+nPu = 2
+nPv = 2
+
+do iPu = 1, nPu
+    do iPv = 1, nPv
+        call partitionNurbsSurface(localSurface, surfaces(1), nPu, nPv, iPu, iPv)
+        ! --- Test 2: near U start boundary ---
+        ! move 10% of the way from start toward midpoint
+        ! this sits close to the left partition boundary
+        u_boundary = localSurface%U(1) + 0.1D0*(localSurface%U(localSurface%nOfKnotsU) - localSurface%U(1))
+        v_boundary = 0.5D0*(localSurface%V(1) + localSurface%V(localSurface%nOfKnotsV))
+        call nurbsSurfacePoint(S_boundary, ptWeight, localSurface, u_boundary, v_boundary)
+        uv_recovered = nurbsSurfacePointProjection(surfaces(1), S_boundary)
+        call nurbsSurfacePoint(S_roundtrip, ptWeight, localSurface, &
+                               uv_recovered(1), uv_recovered(2))
+        if (all(abs(S_boundary - S_roundtrip) < 1.0D-10)) then
+            print *, "Proc (", iPu, ",", iPv, ") U-start:   PASS"
+        else
+            print *, "Proc (", iPu, ",", iPv, ") U-start:   FAIL", &
+                     maxval(abs(S_boundary - S_roundtrip))
+        end if
+        print *, "End inverse evaluation partitioning check near boundary of u"
+
+        ! --- Test 3: near V end boundary ---
+        ! move 10% of the way from end toward midpoint
+        u_boundary = 0.5D0*(localSurface%U(1) + localSurface%U(localSurface%nOfKnotsU))
+        v_boundary = localSurface%V(localSurface%nOfKnotsV) - 0.1D0*(localSurface%V(localSurface%nOfKnotsV) - localSurface%V(1))
+        call nurbsSurfacePoint(S_boundary, ptWeight, localSurface, u_boundary, v_boundary)
+        uv_recovered = nurbsSurfacePointProjection(surfaces(1), S_boundary)
+        call nurbsSurfacePoint(S_roundtrip, ptWeight, localSurface, &
+                               uv_recovered(1), uv_recovered(2))
+        if (all(abs(S_boundary - S_roundtrip) < 1.0D-10)) then
+            print *, "Proc (", iPu, ",", iPv, ")    V-end:     PASS"
+        else
+            print *, "Proc (", iPu, ",", iPv, ")    V-end:     FAIL", &
+                     maxval(abs(S_boundary - S_roundtrip))
+        end if      
+        print *, "End inverse evaluation partitioning check near boundary of v"
+
+        deallocate(localSurface%U, localSurface%V, localSurface%Pw)
+    end do
+end do
+
 !=======================================================================
 ! Testing by calling some routines from the NURBS library
 !=======================================================================
